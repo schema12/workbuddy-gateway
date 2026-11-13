@@ -1,0 +1,86 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 发布 GitHub Release
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify toolchain
+        shell: pwsh
+        run: |
+          go version
+          Get-Content go.mod
+
+      - name: Build all targets
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $match = [regex]::Match((Get-Content -LiteralPath main.go -Raw), '(?m)^\s*version\s*=\s*"([^"]+)"')
+          if (-not $match.Success) { throw '无法从 main.go 读取版本号' }
+          "version=$($match.Groups[1].Value)" >> $env:GITHUB_OUTPUT
+
+      - name: Show manifest
+        shell: pwsh
+        run: |
+          Get-Content -LiteralPath dist/build-manifest.json -Raw
+          Get-Content -LiteralPath dist/SHA256SUMS -Raw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-gateway-v${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.ref_type == 'tag' || inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.version.outputs.version }}'
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "v$version" }
+          $files = @(Get-ChildItem -LiteralPath dist -File | ForEach-Object { $_.FullName })
+          if ($files.Count -eq 0) { throw 'dist 目录没有产物' }
+
+          & gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            & gh release upload $tag @files --clobber
+          } else {
+            & gh release create $tag @files --title "WorkBuddy Gateway $tag" --notes "WorkBuddy Gateway $tag（源码提交 $env:GITHUB_SHA）" --target $env:GITHUB_SHA
+            if ($LASTEXITCODE -ne 0) {
+              & gh release create $tag @files --title "WorkBuddy Gateway $tag" --notes "WorkBuddy Gateway $tag（源码提交 $env:GITHUB_SHA）"
+            }
+          }
+          if ($LASTEXITCODE -ne 0) { throw "发布失败：$tag" }
+          "TAG=$tag" >> $env:GITHUB_STEP_SUMMARY
